@@ -1,5 +1,7 @@
 # Fast Visual Gallery
 
+![Fast Visual Gallery](fast_gallery.jpg)
+
 6k images + 60 videos generated randomly in 17s from fresh,
 
  .venv/bin/python stress_gallery.py scale && open "$TMPDIR/fvg_stress/apps/scale/gallery.html"
