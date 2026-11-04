@@ -1,0 +1,5 @@
+gallery/
+thumbs/
+.DS_Store
+.venv/
+gallery_items.js
