@@ -22,3 +22,18 @@ work dir: /var/folders/fk/4w7lpw7d6blfm4mtpj2m44340000gn/T/fvg_stress
   [INFO] page size: 7 KB HTML + 0.53 MB item list (all cells built at load)
 
 9 passed, 0 failed in 17s
+## Video keyframes
+
+Open a video and its keyframes come up with it. Click a keyframe to jump there; the one playing is outlined.
+
+- **Side by side**: when the video leaves room next to it, like a phone video on a desktop screen, the keyframes fill that space (or go underneath on a tall screen).
+- **Map**: when the video fills the screen, the keyframes sit in a small map over its top-right corner.
+- Press **K** to switch between auto / side / map / off. The page remembers your choice.
+
+The keyframes come from [fast_mp4_grids](../fast_mp4_grids) (`mp4cut`), which decodes only keyframes, so each video takes well under a second whatever its length. Videos that don't have a map yet get one on the next run; the thumbnails stay cached.
+
+    python gallery.py ~/Movies                      # uses ../fast_mp4_grids/bin/mp4cut.mjs
+    python gallery.py ~/Movies --mp4cut /path/to/mp4cut.mjs   # or set $MP4CUT
+    python gallery.py ~/Movies --no-keyframes
+
+You need `node` 22.2 or newer. Without it or the repo, videos open as before.

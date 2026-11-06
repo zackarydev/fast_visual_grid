@@ -7,8 +7,13 @@ Video thumbnails use the same trick as ../mp4_fast_editor: VideoToolbox
 hardware decode, and only the nearest keyframe is decoded, so each video
 costs one short ffmpeg call no matter how long it is.
 
+Opening a video also shows its keyframes, side by side with it or as a small
+map over its corner, made by ../fast_mp4_grids (see keyframes.py). Without
+node or that repo, videos open as before.
+
 Usage:
     python gallery.py [FOLDER] [--size 200] [--recursive] [--no-open]
+                      [--mp4cut PATH] [--no-keyframes]
 """
 import argparse
 import hashlib
@@ -24,6 +29,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
+import keyframes
 import lod_atlas
 
 register_heif_opener()
@@ -44,6 +50,7 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 NEEDS_PREVIEW = {".heic", ".heif"}  # browsers (except Safari) can't show these
 PREVIEW_SIZE = 1600
 VIDEO_JOBS = 6  # VideoToolbox only runs a handful of decode sessions at once
+KEYFRAME_JOBS = 2  # mp4cut runs at once, each with keyframes.JOBS ffmpeg processes
 # The sharp tier loaded near the cursor: short side = thumb size x this, enough
 # to fill a square (cropped) cell on a 2x retina screen.
 MID_SCALE = 2.4
@@ -148,7 +155,7 @@ def make_video_thumb(job):
 
 
 PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>{title}</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title>
 <style>
   body {{ margin:0; background:#1e1e1e; color:#ddd; font:14px system-ui, sans-serif; }}
   header {{ position:sticky; top:0; z-index:5; background:#1e1e1ef0; padding:10px 14px;
@@ -170,14 +177,26 @@ PAGE = """<!doctype html>
   #lb.on {{ display:flex; }}
   #lb img, #lb video {{ max-width:95vw; max-height:88vh; object-fit:contain; }}
   #lb p {{ margin:10px; }} #lb a {{ color:#4a9eff; }}
+  /* Keyframe map: JS places the video and #kf in #stage (see kfLayout). */
+  #lb.kfon #stage {{ position:relative; }}
+  #lb.kfon #vid {{ position:absolute; max-width:none; max-height:none; }}
+  #kf {{ display:none; position:absolute; box-sizing:border-box; overflow:hidden auto;
+        align-content:start; scrollbar-width:thin; }}
+  #lb.kfon #kf {{ display:grid; }}
+  #kf.map {{ background:#000b; padding:4px; border-radius:6px; opacity:.8; transition:opacity .15s; }}
+  #kf.map:hover {{ opacity:1; }}
+  #kf div {{ background-repeat:no-repeat; border-radius:3px; cursor:pointer; }}
+  #kf div:hover {{ box-shadow:inset 0 0 0 1px #4a9eff; }}
+  #kf div.cur {{ box-shadow:inset 0 0 0 2px #4a9eff; }}
 </style></head><body>
 <header><b>{title}</b><input id="q" placeholder="Filter by filename…" autofocus>
 <select id="t"><option value="">All</option><option value="image">Images</option>
 <option value="video">Videos</option></select><span id="n"></span></header>
 <div id="grid"></div>
-<div id="lb"><img id="big"><video id="vid" controls autoplay playsinline></video>
+<div id="lb"><div id="stage"><img id="big"><video id="vid" controls autoplay playsinline></video>
+<div id="kf"></div></div>
 <p><span id="cap"></span> · <a id="open" target="_blank">open original</a>
- · ←/→ to browse, Esc to close</p></div>
+ · ←/→ to browse<span id="kfk"></span>, Esc to close</p></div>
 <script src="{items_js}"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -341,6 +360,8 @@ function show(i) {{
   if (isVid) {{ vid.src = loc(it, 'full'); big.removeAttribute('src'); }}
   else {{ big.src = loc(it, 'view'); vid.removeAttribute('src'); vid.load(); }}
   $('cap').textContent = it.name; $('open').href = loc(it, 'full'); lb.classList.add('on');
+  if (isVid && it.kf) kfBuild(it);
+  kfLayout();
   // Warm the previous and next images so ←/→ shows them instantly.
   const p = visible.indexOf(i);
   for (const d of [1, -1]) {{
@@ -351,10 +372,124 @@ function show(i) {{
 function close() {{ lb.classList.remove('on'); vid.pause(); schedule(); }}
 function step(d) {{ const p = visible.indexOf(cur); if (p < 0) return;
   show(visible[(p + d + visible.length) % visible.length]); }}
-lb.onclick = e => {{ if (e.target === lb) close(); }};
+lb.onclick = e => {{ if (e.target === lb || e.target === stage) close(); }};
 document.onkeydown = e => {{ if (!lb.classList.contains('on')) return;
   if (e.key === 'Escape') close();
-  if (e.key === 'ArrowRight') step(1); if (e.key === 'ArrowLeft') step(-1); }};
+  if (e.key === 'ArrowRight') step(1); if (e.key === 'ArrowLeft') step(-1);
+  if (e.key === 'k' || e.key === 'K') kfCycle(); }};
+
+// Keyframe map (format in keyframes.py): the video's keyframes as a grid of
+// tiles from one sprite; click one to jump there, the one playing is outlined.
+// Auto mode puts it beside the video (or below, on a tall screen) when the
+// fitted video leaves room for a panel, as with a phone video on a desktop;
+// otherwise the video keeps the whole screen and the map sits over its
+// top-right corner. K cycles auto / side / map / off.
+const KF_MODES = ['auto', 'side', 'map', 'off'], PANEL_MIN = 200, PANEL_GAP = 12;
+let kfMode = 'auto', kfTiles = [], kfCur = -1;
+try {{ if (KF_MODES.includes(localStorage.fvgKf)) kfMode = localStorage.fvgKf; }} catch (e) {{}}
+const stage = $('stage'), kfEl = $('kf');
+function kfBuild(it) {{
+  const k = it.kf, rows = Math.ceil(k.n / k.cols), url = 'url(thumbs/' + it.k + '_kf.jpg)';
+  const pos = (v, n) => (n > 1 ? v / (n - 1) * 100 : 0) + '%';
+  kfEl.textContent = ''; kfEl.scrollTop = 0;
+  kfTiles = k.t.map((t, i) => {{
+    const d = document.createElement('div'), st = d.style;
+    st.backgroundImage = url; st.backgroundSize = k.cols * 100 + '% ' + rows * 100 + '%';
+    st.backgroundPosition = pos(i % k.cols, k.cols) + ' ' + pos(Math.floor(i / k.cols), rows);
+    d.title = fmt(t); kfEl.appendChild(d); return d;
+  }});
+  kfCur = -1;
+}}
+function kfCycle() {{
+  kfMode = KF_MODES[(KF_MODES.indexOf(kfMode) + 1) % KF_MODES.length];
+  try {{ localStorage.fvgKf = kfMode; }} catch (e) {{}}
+  kfLayout();
+}}
+// Biggest tiles (aspect a = w/h) that fit n of them in pw x ph with no
+// scrolling; below tmin, tiles stay at tmin and the panel scrolls. Ties go to
+// the narrowest grid beside the video, the shortest one below it.
+function fitTiles(n, a, pw, ph, gap, tmin, tmax, across) {{
+  let best = null;
+  for (let j = 1; j <= n; j++) {{
+    const c = across ? j : n + 1 - j, r = Math.ceil(n / c);
+    const tw = Math.min((pw - (c - 1) * gap) / c, (ph - (r - 1) * gap) / r * a, tmax);
+    if (!best || tw > best.tw + 0.5) best = {{ c, tw }};
+  }}
+  let {{ c, tw }} = best;
+  if (tw < tmin) {{ c = Math.max(1, Math.floor((pw + gap) / (tmin + gap))); tw = Math.min(tmax, (pw - (c - 1) * gap) / c); }}
+  const r = Math.ceil(n / c), th = tw / a;
+  return {{ c, tw, th, gap, w: c * tw + (c - 1) * gap, h: Math.min(ph, r * th + (r - 1) * gap) }};
+}}
+function place(el, x, y, w, h) {{
+  Object.assign(el.style, {{ left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' }});
+}}
+function kfLayout() {{
+  const it = items[cur], k = it && it.type === 'video' && it.kf && it.kf.n > 1 ? it.kf : null;
+  const on = !!k && kfMode !== 'off';
+  lb.classList.toggle('kfon', on);
+  $('kfk').textContent = k ? ' · K keyframes: ' + kfMode : '';
+  if (!on) {{ for (const el of [stage, vid]) Object.assign(el.style, {{ left: '', top: '', width: '', height: '' }}); return; }}
+  const W = innerWidth - 24, H = innerHeight - lb.querySelector('p').offsetHeight - 32, a = k.w / k.h;
+  const fw = Math.min(W, H * a), fh = fw / a;  // the video fitted to the whole stage
+  let mode = kfMode;
+  if (mode === 'auto') mode = Math.max(W - fw, H - fh) >= PANEL_MIN + PANEL_GAP ? 'side' : 'map';
+  kfEl.classList.toggle('map', mode === 'map');
+  place(stage, 0, 0, W, H);
+  const tmax = k.w * 1.25;  // the sprite's own resolution, give or take
+  let g;
+  if (mode === 'map') {{
+    const pad = 4, m = 10;
+    g = fitTiles(k.n, a, Math.max(120, fw * .25) - 2 * pad, Math.max(90, fh * .4) - 2 * pad, 2, a >= 1 ? 32 : 22, tmax, true);
+    const vx = (W - fw) / 2, vy = (H - fh) / 2;
+    place(vid, vx, vy, fw, fh);
+    place(kfEl, vx + fw - g.w - 2 * pad - m, vy + m, g.w + 2 * pad, g.h + 2 * pad);
+  }} else {{
+    // Beside or below, whichever leaves the bigger video; it shrinks only if
+    // the panel was forced on with no room for it.
+    const wa = Math.min(fw, W - PANEL_MIN - PANEL_GAP), wb = Math.min(fh, H - PANEL_MIN - PANEL_GAP) * a;
+    const across = wa > wb + 0.5 || (Math.abs(wa - wb) <= 0.5 && W - fw >= H - fh);
+    const vw = Math.max(1, across ? wa : wb), vh = vw / a, tmin = a >= 1 ? 72 : 48;
+    if (across) {{
+      g = fitTiles(k.n, a, W - vw - PANEL_GAP, H, 4, tmin, tmax, true);
+      const x = (W - vw - PANEL_GAP - g.w) / 2;
+      place(vid, x, (H - vh) / 2, vw, vh);
+      place(kfEl, x + vw + PANEL_GAP, (H - g.h) / 2, g.w, g.h);
+    }} else {{
+      g = fitTiles(k.n, a, W, H - vh - PANEL_GAP, 4, tmin, tmax, false);
+      const y = (H - vh - PANEL_GAP - g.h) / 2;
+      place(vid, (W - vw) / 2, y, vw, vh);
+      place(kfEl, (W - g.w) / 2, y + vh + PANEL_GAP, g.w, g.h);
+    }}
+  }}
+  Object.assign(kfEl.style, {{ gridTemplateColumns: 'repeat(' + g.c + ', ' + g.tw + 'px)',
+    gridAutoRows: g.th + 'px', gap: g.gap + 'px' }});
+  kfCur = -1; kfTrack();
+}}
+// Outline the keyframe at or before the playhead, scrolling the panel to it
+// unless the pointer is over the panel (someone browsing it).
+function kfTrack() {{
+  const k = items[cur] && items[cur].kf;
+  if (!k || !lb.classList.contains('kfon')) return;
+  const now = vid.currentTime + 0.05;
+  let i = 0;
+  while (i + 1 < k.n && k.t[i + 1] <= now) i++;
+  if (i === kfCur) return;
+  if (kfTiles[kfCur]) kfTiles[kfCur].classList.remove('cur');
+  kfCur = i; const t = kfTiles[i]; t.classList.add('cur');
+  if (kfEl.matches(':hover')) return;
+  const top = t.offsetTop, bot = top + t.offsetHeight;
+  if (top < kfEl.scrollTop) kfEl.scrollTop = top - 4;
+  else if (bot > kfEl.scrollTop + kfEl.clientHeight) kfEl.scrollTop = bot - kfEl.clientHeight + 4;
+}}
+kfEl.onclick = e => {{
+  const i = kfTiles.indexOf(e.target), k = items[cur].kf;
+  if (i < 0) return;
+  vid.currentTime = k.t[i];  // playing or paused, as it was
+  kfTrack();
+}};
+vid.addEventListener('timeupdate', kfTrack);
+vid.addEventListener('seeked', kfTrack);
+addEventListener('resize', () => {{ if (lb.classList.contains('on')) kfLayout(); }});
 </script></body></html>
 """
 
@@ -386,6 +521,10 @@ def main():
     p.add_argument("--size", type=int, default=200, help="thumbnail size in px (default: 200)")
     p.add_argument("--recursive", action="store_true", help="include subfolders")
     p.add_argument("--no-open", action="store_true", help="don't open the browser when done")
+    p.add_argument("--mp4cut", default=str(keyframes.default_mp4cut(HERE)),
+                   help="fast_mp4_grids' bin/mp4cut.mjs, for video keyframe maps "
+                        "(default: $MP4CUT or ../fast_mp4_grids/bin/mp4cut.mjs)")
+    p.add_argument("--no-keyframes", action="store_true", help="don't make video keyframe maps")
     args = p.parse_args()
 
     folder = Path(args.folder).expanduser().resolve()
@@ -416,6 +555,15 @@ def main():
             preview = str(THUMBS / f"{key}_view.jpg") if f.suffix.lower() in NEEDS_PREVIEW else None
             image_jobs.append((key, (str(f), thumb, preview, args.size)))
 
+    # Keyframe maps: every video that doesn't have one yet (a failed attempt is
+    # cached as kf=None, like an unreadable file). New and cached videos alike,
+    # so a gallery built before keyframe maps existed gains them on its next run.
+    tool = None if args.no_keyframes else keyframes.find_tool(args.mp4cut)
+    kf_jobs = []
+    if tool:
+        kf_jobs = [(key, str(f), str(THUMBS / f"{key}_kf.jpg")) for f, key, kind in entries
+                   if kind == "video" and (key not in meta or (meta[key] is not None and "kf" not in meta[key]))]
+
     # Biggest files first, handed out one at a time, so no worker is left
     # holding a run of slow files at the end while the others sit idle.
     image_jobs.sort(key=lambda j: -os.path.getsize(j[1][0]))
@@ -423,6 +571,10 @@ def main():
     print(f"{len(files)} files found ({sum(k == 'video' for *_, k in entries)} videos), "
           f"{len(files) - len(image_jobs) - len(video_jobs)} cached, "
           f"{len(image_jobs)} images + {len(video_jobs)} videos to process")
+    if tool:
+        print(f"  keyframe maps: {len(kf_jobs)} videos to map")
+    elif not args.no_keyframes:
+        print(f"  keyframe maps off: needs node and {args.mp4cut}")
 
     failed = set()
 
@@ -433,16 +585,26 @@ def main():
             meta[key] = res  # None = unreadable, remembered so it isn't retried
             progress(label, i, len(jobs))
 
-    # Videos run on threads (the work is in ffmpeg) alongside the image process pool.
-    # The cache is saved even on Ctrl-C, so finished work isn't redone.
+    # Videos and keyframe maps run on threads (the work is in ffmpeg and mp4cut)
+    # alongside the image process pool. The cache is saved even on Ctrl-C, so
+    # finished work isn't redone.
+    kf_done = {}
     try:
-        with ThreadPoolExecutor(VIDEO_JOBS) as vex, ProcessPoolExecutor(os.cpu_count()) as iex:
+        with ThreadPoolExecutor(VIDEO_JOBS) as vex, ThreadPoolExecutor(KEYFRAME_JOBS) as kex, \
+                ProcessPoolExecutor(os.cpu_count()) as iex:
+            kfs = kex.map(lambda j: keyframes.make(tool, j[1], j[2]), kf_jobs)
             vids = vex.map(make_video_thumb, [j for _, j in video_jobs])
             if image_jobs:
                 collect("images", image_jobs, iex.map(make_image_thumb, [j for _, j in image_jobs]))
             if video_jobs:
                 collect("videos", video_jobs, vids)
+            for i, ((key, *_), kf) in enumerate(zip(kf_jobs, kfs), 1):
+                kf_done[key] = kf
+                progress("keyframes", i, len(kf_jobs))
     finally:
+        for key, kf in kf_done.items():
+            if meta.get(key) is not None:  # not for a video that turned out unreadable
+                meta[key]["kf"] = kf
         save_meta(meta)
     if failed:
         print(f"  skipped {len(failed)} unreadable file(s)")
@@ -457,6 +619,8 @@ def main():
         item = {"k": key, "name": f.relative_to(folder).as_posix(), "type": kind}
         if kind == "video":
             item["dur"] = round(res.get("dur", 0), 1)
+            if res.get("kf") and (THUMBS / f"{key}_kf.jpg").exists():
+                item["kf"] = res["kf"]
         elif f.suffix.lower() in NEEDS_PREVIEW:
             item["view"] = 1
         items.append(item)

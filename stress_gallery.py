@@ -31,6 +31,7 @@ from PIL import Image, ImageChops, ImageOps, ImageStat
 from pillow_heif import register_heif_opener
 
 import gallery  # only for cache_key / mid_path, to find a file's outputs
+import keyframes
 import lod_atlas
 from fake_images import noise_image
 
@@ -39,6 +40,7 @@ register_heif_opener()
 HERE = Path(__file__).resolve().parent
 ROOT = Path(tempfile.gettempdir()) / "fast_visual"
 PY = sys.executable
+MP4CUT = keyframes.default_mp4cut(HERE)  # the app copies can't find ../fast_mp4_grids themselves
 STATS = re.compile(r"(\d+) files found \((\d+) videos\), (\d+) cached, (\d+) images \+ (\d+) videos to process")
 
 results = []  # (suite, name, status, detail)
@@ -58,7 +60,7 @@ def make_app(name):
     app = ROOT / "apps" / name
     shutil.rmtree(app, ignore_errors=True)
     app.mkdir(parents=True)
-    for f in ("gallery.py", "lod_atlas.py"):
+    for f in ("gallery.py", "lod_atlas.py", "keyframes.py"):
         shutil.copy(HERE / f, app / f)
     return app
 
@@ -88,6 +90,8 @@ class Run:
         self.todo = None if m is None else self.img_todo + self.vid_todo
         s = re.search(r"skipped (\d+)", out)
         self.skipped = int(s.group(1)) if s else 0
+        k = re.search(r"keyframe maps: (\d+) videos to map", out)
+        self.kf_todo = int(k[1]) if k else None
         a = re.search(r"atlas: (\d+) of (\d+) chunks built in ([\d.]+)s", out)
         self.atlas_built, self.atlas_chunks, self.atlas_secs = (int(a[1]), int(a[2]), float(a[3])) if a else (None,) * 3
 
@@ -96,7 +100,7 @@ class Run:
 
 
 def start(app, folder, *extra, env=None):
-    cmd = [PY, str(app / "gallery.py"), str(folder), "--no-open", *extra]
+    cmd = [PY, str(app / "gallery.py"), str(folder), "--no-open", "--mp4cut", str(MP4CUT), *extra]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             env=env, start_new_session=True)  # own process group, like a terminal
 
@@ -149,13 +153,41 @@ def load_meta(app):
         return None
 
 
-def thumb_files(app, key, kind_view=False):
+def thumb_files(app, key, kind_view=False, kf=False):
     """Where gallery.py stores a key's generated sizes. The one place to change if thumbnails get packed."""
     t = str(app / "thumbs" / f"{key}.jpg")
     files = [t, gallery.mid_path(t)]
     if kind_view:
         files.append(str(app / "thumbs" / f"{key}_view.jpg"))
+    if kf:
+        files.append(kf_sprite(app, key))
     return files
+
+
+def kf_sprite(app, key):
+    return str(app / "thumbs" / f"{key}_kf.jpg")
+
+
+def kf_problems(app, it):
+    """What's wrong with an item's keyframe map, checked against its sprite. [] = fine."""
+    k = it.get("kf")
+    if not k:
+        return ["no keyframe map"]
+    bad = []
+    if not (k["n"] == len(k["t"]) >= 1):
+        bad.append(f"n={k['n']} but {len(k['t'])} times")
+    if k["t"] != sorted(k["t"]) or k["t"][0] != 0:
+        bad.append(f"times not ascending from 0: {k['t'][:5]}")
+    if it.get("dur") and k["t"][-1] > it["dur"] + 0.5:
+        bad.append(f"last keyframe {k['t'][-1]}s past the end ({it['dur']}s)")
+    try:
+        with Image.open(kf_sprite(app, it["k"])) as im:
+            want = (k["cols"] * k["w"], -(-k["n"] // k["cols"]) * k["h"])
+            if im.size != want:
+                bad.append(f"sprite {im.size}, layout wants {want}")
+    except OSError as e:
+        bad.append(f"sprite unreadable: {e}")
+    return bad
 
 
 def dir_stats(d):
@@ -258,8 +290,18 @@ def suite_scale(args):
     check("scale", "page lists every file", len(items) == expected, f"{len(items)} items")
     check("scale", "item names unique", len({i['name'] for i in items}) == len(items))
     missing = [i["name"] for i in items
-               if not all(os.path.exists(f) for f in thumb_files(app, i["k"], i.get("view")))]
+               if not all(os.path.exists(f) for f in thumb_files(app, i["k"], i.get("view"), "kf" in i))]
     check("scale", "every item has its generated files", not missing, f"{len(missing)} missing, e.g. {missing[:3]}")
+    vids = [i for i in items if i["type"] == "video"]
+    check("scale", "cold run maps every video's keyframes", cold.kf_todo == len(vids), f"{cold.kf_todo} / {len(vids)}")
+    check("scale", "warm run maps nothing", warm.kf_todo == 0, f"{warm.kf_todo} to map")
+    bad = [f"{i['name']}: {p}" for i in vids for p in kf_problems(app, i)]
+    check("scale", "every video has a sound keyframe map", not bad, f"{len(bad)} problems, e.g. {bad[:3]}")
+    if vids and not bad:
+        sprites = [Path(kf_sprite(app, i["k"])) for i in vids]
+        mb = sum(f.stat().st_size for f in sprites) / 1e6
+        check("scale", "keyframe maps", None, f"{sum(i['kf']['n'] for i in vids)} keyframes in {len(vids)} sprites, "
+              f"{mb:.1f} MB, {mb * 1e3 / len(vids):.0f} KB/video")
     n, mb = dir_stats(app / "thumbs")
     check("scale", "thumbs/ footprint", None, f"{n} files, {mb:.0f} MB, {mb * 1e3 / max(n, 1):.1f} KB/file avg")
     suite_atlas_checks(app, items, cold, warm)
@@ -378,8 +420,11 @@ def hostile_fixtures(d):
     make_video(d / "portrait.mov", 720, 1280, 3, 5)
     make_video(d / "long_gop.mp4", 640, 360, 20, 6, codec=("-c:v", "libx264", "-preset", "ultrafast",
                                                            "-pix_fmt", "yuv420p", "-g", "9999"))
+    # Stored landscape, flagged to display rotated 90° (as phones record): portrait on screen.
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-display_rotation", "90",
+                    "-i", str(d / "clip.mkv"), "-c", "copy", str(d / "rotated_meta.mp4")], check=True)
     exp.update({n: "ok" for n in ["one_frame.mp4", "clip.webm", "clip.mkv", "clip.avi",
-                                   "portrait.mov", "long_gop.mp4"]})
+                                   "portrait.mov", "long_gop.mp4", "rotated_meta.mp4"]})
 
     # names that test escaping in HTML, JSON and URLs
     for name in ["spaces and 'quotes\".jpg", "café 日本語 🎉.jpg", "<!--<script>.jpg",
@@ -447,7 +492,7 @@ def suite_hostile(args):
             if not (0 < max(t.size) <= args.size and min(t.size) >= 1):
                 bad.append(f"{name} {t.size}")
     check("hostile", "thumbnails within size bounds", not bad, ", ".join(bad))
-    for name in ["exif_rotated.jpg", "portrait.mov"]:
+    for name in ["exif_rotated.jpg", "portrait.mov", "rotated_meta.mp4"]:
         t = thumb(name)
         check("hostile", f"{name} thumbnail is portrait", t is not None and t.height > t.width,
               f"{t.size}" if t else "no thumbnail")
@@ -455,6 +500,20 @@ def suite_hostile(args):
     if t:
         mean = sum(t.convert("L").getdata()) / (t.width * t.height)
         check("hostile", "16-bit PNG not blown out to white", mean < 240, f"mean brightness {mean:.0f}/255")
+    # Keyframe maps: every readable video gets one, upright, from any container
+    # but AVI: mp4cut is told its MPEG-4 Part 2 frames are keyframes that the
+    # decoder then skips. Browsers can't play AVI anyway; it opens without a map.
+    vids = [n for n, w in exp.items() if w == "ok" and Path(n).suffix.lower() in gallery.VIDEO_EXTS
+            and n != "clip.avi"]
+    bad = [f"{n}: {p}" for n in vids for p in (kf_problems(app, by_name[n]) if n in by_name else ["not listed"])]
+    check("hostile", "every readable video has a keyframe map", not bad, "; ".join(bad))
+    for name, portrait in [("portrait.mov", True), ("rotated_meta.mp4", True), ("clip.mkv", False)]:
+        k = by_name.get(name, {}).get("kf")
+        check("hostile", f"{name} keyframes are {'portrait' if portrait else 'landscape'}",
+              bool(k) and (k["h"] > k["w"]) == portrait, f"{k['w']}x{k['h']}" if k else "no map")
+    for name in ["long_gop.mp4", "one_frame.mp4", "clip.avi"]:
+        k = by_name.get(name, {}).get("kf")
+        check("hostile", f"{name} keyframe map", None, f"{k['n']} keyframes" if k else "none")
     it = by_name.get("real.heic")
     check("hostile", "HEIC gets a browser-viewable preview",
           bool(it and it.get("view") and os.path.exists(thumb_files(app, it["k"], True)[2])))
@@ -581,6 +640,14 @@ def suite_cache(args):
     check("cache", "no ffmpeg on PATH: fails gracefully", r.code == 0, r.tail(200) if r.code else f"{r.skipped} skipped")
     r = run(app, vids, "--size", size)
     check("cache", "videos retried once ffmpeg is back", r.vid_todo == 6, f"{r.vid_todo} of 6 retried")
+    check("cache", "keyframe maps made once ffmpeg is back", r.kf_todo == 6, f"{r.kf_todo} of 6 mapped")
+
+    # Keyframe maps added to a gallery built without them: only the maps are made.
+    app = make_app("cache_kf_later")
+    run(app, vids, "--size", size, "--no-keyframes")
+    r = run(app, vids, "--size", size)
+    check("cache", "keyframe maps added later: thumbnails kept", r.todo == 0 and r.kf_todo == 6,
+          f"{r.todo} thumbnails redone, {r.kf_todo} of 6 mapped")
 
 
 # ---------------------------------------------------------------- main
